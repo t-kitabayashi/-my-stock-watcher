@@ -59,6 +59,25 @@ def convert_value(val, from_curr, to_curr, rate):
         return val / rate
     return val
 
+# Monte Carlo Simulation Helper
+def run_monte_carlo(current_price, returns, days, simulations=100):
+    import numpy as np
+    mu = returns.mean()
+    sigma = returns.std()
+    
+    results = np.zeros((days, simulations))
+    for i in range(simulations):
+        prices = [current_price]
+        for _ in range(days - 1):
+            prices.append(prices[-1] * (1 + np.random.normal(mu, sigma)))
+        results[:, i] = prices
+    
+    # 95% Confidence Interval
+    lower = np.percentile(results, 2.5, axis=1)
+    upper = np.percentile(results, 97.5, axis=1)
+    median = np.percentile(results, 50, axis=1)
+    return lower, upper, median
+
 # Display logic
 st.subheader(f"Market Overview ({display_currency})")
 
@@ -142,12 +161,20 @@ else:
             month_chg = ((curr_val - month_val) / month_val) * 100
             year_chg = ((curr_val - year_val) / year_val) * 100
             
+            # Simple MC for list overview (3 months ahead)
+            returns = valid_data.pct_change().dropna()
+            mc_low, mc_high, _ = run_monte_carlo(curr_val, returns, 90)
+            
+            mc_low_pct = ((mc_low[-1] - curr_val) / curr_val) * 100
+            mc_high_pct = ((mc_high[-1] - curr_val) / curr_val) * 100
+            
             summary_data.append({
                 "銘柄名": name,
                 f"現在値 ({display_currency})": f"{symbol_mark}{curr_val:,.2f}",
                 "前日比 (%)": day_chg,
                 "前月比 (%)": month_chg,
                 "前年比 (%)": year_chg,
+                "3ヶ月後予測(95%幅)": f"{symbol_mark}{mc_low[-1]:,.0f} ~ {symbol_mark}{mc_high[-1]:,.0f} ({mc_low_pct:+.1f}% ~ {mc_high_pct:+.1f}%)",
                 "Symbol": symbol
             })
     
@@ -248,9 +275,10 @@ if not hist_df.empty:
     plot_df["5y MA"] = plot_df["Display"].rolling(window=240*5).mean()
 
     # Prediction Logic
+    prediction_data = None
+    ma_col = None
     if show_analysis:
         import numpy as np
-        # Define period mapping
         period_map = {
             "3ヶ月": {"days": 90, "ma_col": "3m MA"},
             "6ヶ月": {"days": 180, "ma_col": "6m MA"},
@@ -262,70 +290,92 @@ if not hist_df.empty:
         forecast_days = p_info["days"]
         ma_col = p_info["ma_col"]
 
-        # Linear Regression on available data
+        # 1. Linear Projection
         y_data = plot_df["Display"].dropna()
         x_data = np.arange(len(y_data))
-        
-        # Fit a line
         z = np.polyfit(x_data, y_data, 1)
         p = np.poly1d(z)
+        plot_df["Projection"] = p(x_data)
         
-        # Future projection
+        # 2. Monte Carlo Simulation
+        returns = y_data.pct_change().dropna()
+        mc_low, mc_high, mc_med = run_monte_carlo(y_data.iloc[-1], returns, forecast_days)
+        
         last_date_val = plot_df.index[-1]
         future_dates = [last_date_val + pd.Timedelta(days=i) for i in range(1, forecast_days + 1)]
-        future_x = np.arange(len(y_data), len(y_data) + forecast_days)
-        future_preds = p(future_x)
         
-        # Predicted value & Percentage change
-        current_price_val = y_data.iloc[-1]
-        pred_val = future_preds[-1]
-        pct_change = ((pred_val - current_price_val) / current_price_val) * 100
-        symbol_mark = "¥" if display_currency == "JPY" else "$"
-        st.success(f"📊 {analysis_period}後の予測値 ({display_currency}): {symbol_mark}{pred_val:,.2f} (現在比: {pct_change:+.2f}%)")
-        
-        # Add prediction to DataFrame for plotting
-        pred_df = pd.DataFrame({
-            "Display": [np.nan] * forecast_days,
-            "3m MA": [np.nan] * forecast_days,
-            "6m MA": [np.nan] * forecast_days,
-            "1y MA": [np.nan] * forecast_days,
-            "3y MA": [np.nan] * forecast_days,
-            "5y MA": [np.nan] * forecast_days,
-            "Projection": future_preds
+        prediction_data = pd.DataFrame({
+            "Projection": p(np.arange(len(y_data), len(y_data) + forecast_days)),
+            "MC_Median": mc_med,
+            "MC_Lower": mc_low,
+            "MC_Upper": mc_high
         }, index=future_dates)
         
-        # Merge with main df for plotting
-        plot_df["Projection"] = p(x_data) # Historical trend line
-        plot_df = pd.concat([plot_df, pred_df])
+        symbol_mark = "¥" if display_currency == "JPY" else "$"
+        curr_p = y_data.iloc[-1]
+        mc_high_pct = ((mc_high[-1] - curr_p) / curr_p) * 100
+        mc_low_pct = ((mc_low[-1] - curr_p) / curr_p) * 100
+        st.success(f"📊 {analysis_period}後の強気予測 (97.5%): {symbol_mark}{mc_high[-1]:,.2f} ({mc_high_pct:+.1f}%) / 弱気予測 (2.5%): {symbol_mark}{mc_low[-1]:,.2f} ({mc_low_pct:+.1f}%)")
+
+    # Plotting with Plotly for Shaded Area
+    import plotly.graph_objects as go
+
+    def create_plotly_chart(target_df, pred_df, ma_name):
+        fig = go.Figure()
+        # Historical Price
+        fig.add_trace(go.Scatter(x=target_df.index, y=target_df["Display"], name="Price", line=dict(color='royalblue', width=2)))
+        # Moving Average
+        if show_analysis and ma_name in target_df.columns:
+            fig.add_trace(go.Scatter(x=target_df.index, y=target_df[ma_name], name=ma_name, line=dict(dash='dash', color='orange')))
+        
+        # Predictions
+        if pred_df is not None:
+            # Shaded Area (MC Range)
+            fig.add_trace(go.Scatter(
+                x=list(pred_df.index) + list(pred_df.index)[::-1],
+                y=list(pred_df["MC_Upper"]) + list(pred_df["MC_Lower"])[::-1],
+                fill='toself',
+                fillcolor='rgba(0,176,246,0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                hoverinfo="skip",
+                showlegend=True,
+                name="MC 95% Range"
+            ))
+            # Linear Projection
+            fig.add_trace(go.Scatter(x=pred_df.index, y=pred_df["Projection"], name="Trend Projection", line=dict(color='red', width=2)))
+            # Historical Trend Line (Optional)
+            fig.add_trace(go.Scatter(x=target_df.index, y=target_df["Projection"], name="Historical Trend", line=dict(color='red', width=1, dash='dot'), showlegend=False))
+
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=20, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor='LightGray')
+        )
+        return fig
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["3ヶ月", "6ヶ月", "1年", "3年", "5年"])
     last_date_actual = hist_df.index[-1]
     
-    # Prepare columns to show
-    cols_to_plot = ["Display"]
-    if show_analysis:
-        cols_to_plot.append(ma_col)
-        cols_to_plot.append("Projection")
-
     with tab1:
         mask = plot_df.index > (last_date_actual - pd.Timedelta(days=90))
-        st.line_chart(plot_df.loc[mask, cols_to_plot])
+        st.plotly_chart(create_plotly_chart(plot_df.loc[mask], prediction_data, ma_col), use_container_width=True)
         
     with tab2:
         mask = plot_df.index > (last_date_actual - pd.Timedelta(days=180))
-        st.line_chart(plot_df.loc[mask, cols_to_plot])
+        st.plotly_chart(create_plotly_chart(plot_df.loc[mask], prediction_data, ma_col), use_container_width=True)
         
     with tab3:
         mask = plot_df.index > (last_date_actual - pd.Timedelta(days=365))
-        st.line_chart(plot_df.loc[mask, cols_to_plot])
+        st.plotly_chart(create_plotly_chart(plot_df.loc[mask], prediction_data, ma_col), use_container_width=True)
 
     with tab4:
         mask = plot_df.index > (last_date_actual - pd.Timedelta(days=365*3))
-        st.line_chart(plot_df.loc[mask, cols_to_plot])
+        st.plotly_chart(create_plotly_chart(plot_df.loc[mask], prediction_data, ma_col), use_container_width=True)
 
     with tab5:
-        # Full 5 years
-        st.line_chart(plot_df[cols_to_plot])
+        st.plotly_chart(create_plotly_chart(plot_df, prediction_data, ma_col), use_container_width=True)
 else:
     st.warning("No historical data available for this ticker.")
 
