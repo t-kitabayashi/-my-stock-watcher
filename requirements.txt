@@ -1,11 +1,5 @@
-<<<<<<< HEAD
 streamlit
 yfinance
 pandas
 plotly
-=======
-streamlit
-yfinance
-pandas
-plotly
->>>>>>> origin/main
+numpy
